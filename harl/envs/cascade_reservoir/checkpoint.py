@@ -199,6 +199,9 @@ def save_checkpoint(runner, path):
     if shared_actor:
         metadata.update(actor_parameter_sharing=True, agent_ids=list(range(len(IDS))),
                         actor_observation_dim=actor_dim, raw_actor_observation_dim=raw_dim)
+    if getattr(runner, 'credit_assignment', 'team_gae') == 'counterfactual':
+        metadata.update(happo_credit_assignment='counterfactual',
+                        actor_advantage_estimator='one_step_counterfactual')
     payload = dict(format=CHECKPOINT_FORMAT, version=CHECKPOINT_VERSION,
         metadata=metadata, metadata_sha256=_digest(metadata), actors=actor_states,
         critic=critic_state, value_normalizer=normalizer_state)
@@ -271,6 +274,13 @@ def load_checkpoint(path, data_root=None):
         if not isinstance(shared_actor, bool):
             raise ValueError('Checkpoint actor parameter sharing must be a boolean')
         args = settings['algorithm']
+        credit_mode = args['algo'].get('happo_credit_assignment','team_gae')
+        if credit_mode not in ('team_gae','counterfactual'):
+            raise ValueError('Checkpoint has unsupported actor credit assignment')
+        if (metadata.get('happo_credit_assignment','team_gae') != credit_mode or
+                (credit_mode == 'counterfactual' and (metadata.get('algorithm_name') != 'happo' or
+                 metadata.get('actor_advantage_estimator') != 'one_step_counterfactual'))):
+            raise ValueError('Checkpoint actor credit metadata disagrees with its settings')
         configured_sharing = args['algo'].get('share_param', False)
         if not isinstance(configured_sharing, bool) or configured_sharing != shared_actor:
             raise ValueError('Checkpoint actor-sharing architecture disagrees with its settings')

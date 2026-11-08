@@ -63,6 +63,13 @@ def checkpoint_directories(episode_log, seeds, enabled=False):
     return {seed: path.with_name(path.stem+'_seed'+str(seed)+'_checkpoints') for seed in seeds}
 
 
+def counterfactual_credit_paths(episode_log, seeds, enabled=False):
+    if episode_log is None or not enabled:
+        return {}
+    path = Path(episode_log)
+    return {seed:path.with_name(path.stem+'_seed'+str(seed)+'_counterfactual_credit.csv.gz') for seed in seeds}
+
+
 def check_episode_inputs(data,physical,years,days,bins):
     """Validate the episode view and reset observations, without a future-flow solver."""
     env=episode_environment(data,physical,years,days,bins)
@@ -136,6 +143,11 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
     training_samplers={seed:TrainingWindowSampler(data,days,episodes,count,seed,mode=sampling_mode)
                        for seed in config['experiment']['seeds']}
     bins=config['model']['action_bins']
+    credit_mode=config['algo'].get('happo_credit_assignment','team_gae')
+    if credit_mode not in ('team_gae','counterfactual'):
+        raise ValueError('happo_credit_assignment must be team_gae or counterfactual')
+    if credit_mode == 'counterfactual' and getattr(runner_cls,'algorithm_name','happo') != 'happo':
+        raise ValueError('Counterfactual credit is a HAPPO-only variant')
     xld_enabled=config['experiment'].get('xld_diagnostics',False)
     if not isinstance(xld_enabled,bool):
         raise ValueError('xld_diagnostics must be a boolean')
@@ -155,11 +167,12 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
     xld_paths=xld_dispatch_paths(args.episode_log,config['experiment']['seeds'],xld_enabled)
     trajectory_paths=trajectory_diagnostics_paths(args.episode_log,config['experiment']['seeds'],trajectory_enabled)
     checkpoint_dirs=checkpoint_directories(args.episode_log,config['experiment']['seeds'],checkpoints_enabled)
+    credit_paths=counterfactual_credit_paths(args.episode_log,config['experiment']['seeds'],credit_mode=='counterfactual')
     figure_paths={} if args.no_plot else plot_output_paths(args.episode_log)
     periodic_windows=select_periodic_windows(data)
     for path in (([] if args.episode_log is None else [args.episode_log])+
                  list(daily_paths.values())+list(xld_paths.values())+list(figure_paths.values())+
-                 list(trajectory_paths.values())+list(checkpoint_dirs.values())):
+                 list(trajectory_paths.values())+list(checkpoint_dirs.values())+list(credit_paths.values())):
         if path.exists():
             raise ValueError('Output file already exists: '+str(path))
     evaluation_years=list(data.evaluation_years)
@@ -298,6 +311,17 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
     metadata['comparison_context']=comparison_context
     metadata['actor_architecture']=actor_architecture
     metadata['learning_objective']=learning_objective
+    if credit_mode == 'counterfactual':
+        learning_objective.update(advantage_source='counterfactual_shared_team',
+            normalization='common_controllable_rms_without_centering')
+        metadata['counterfactual_credit'] = dict(enabled=True,
+            actor_estimator='one_step_counterfactual', critic_target='existing team GAE/discounted returns',
+            q_definition='exact current system reward + gamma * frozen denormalized V(next state); terminal continuation is zero',
+            advantage='selected Q minus old-policy probability-weighted Q over all own commands; other original commands fixed',
+            normalization='one common RMS over controllable actor rows; no centering',
+            batch_size=config['algo'].get('counterfactual_batch_size',4096),
+            files={str(seed):str(path.resolve()) for seed,path in credit_paths.items()},
+            role='model-assisted HAPPO variant; no monotonic-improvement or physical optimality claim')
     if team_advantage:
         metadata['learning_reward_architecture'].update(
             actor_reward=learning_objective['reward_formula'],
@@ -306,6 +330,11 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
             update_interpretation='sequential HAPPO clipped surrogates use one shared team advantage; '
                 'the global reward is counted once in the team reward')
         metadata['trajectory_diagnostics']['advantages']='shared team reward/value channel 0; normalized once over common rollout rows; actor-entry HAPPO factor remains separate'
+        if credit_mode == 'counterfactual':
+            metadata['learning_reward_architecture'].update(
+                actor_advantages='actor-specific frozen one-step system-Q minus its old-policy counterfactual baseline; common RMS scaling',
+                update_interpretation='model-assisted HAPPO surrogate with actor-specific counterfactual credit and sequential likelihood factors')
+            metadata['trajectory_diagnostics']['advantages']='frozen one-step counterfactual raw/normalized actor credit; critic GAE fields remain separate'
     if algorithm_name is not None:
         metadata['algorithm']=algorithm_name
     if algorithm_name=='mappo':
@@ -325,6 +354,7 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
         daily_writers={}
         xld_writers={}
         trajectory_writers={}
+        credit_writers={}
         if args.episode_log is not None:
             args.episode_log.parent.mkdir(parents=True,exist_ok=True)
             stream=outputs.enter_context(args.episode_log.open('x',encoding='utf-8'))
@@ -334,14 +364,19 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
                 path.open('x',encoding='utf-8',newline=''))) for seed,path in xld_paths.items()}
             trajectory_writers={seed:outputs.enter_context(TrajectoryDiagnosticsWriter(path))
                                 for seed,path in trajectory_paths.items()}
+            if credit_paths:
+                from harl.envs.cascade_reservoir.counterfactual_logging import CounterfactualCreditWriter
+                credit_writers={seed:outputs.enter_context(CounterfactualCreditWriter(path))
+                                for seed,path in credit_paths.items()}
         log_episode(metadata,stream)
         runners=[]
         for seed in config['experiment']['seeds']:
+            credit_options={'counterfactual_log':credit_writers[seed]} if seed in credit_writers else {}
             runner=runner_cls(data,physical,config,seed,episode_log=stream,
                                           step_log=daily_writers.get(seed),periodic_windows=periodic_windows,
                                           training_sampler=training_samplers[seed],xld_log=xld_writers.get(seed),
                                           trajectory_log=trajectory_writers.get(seed),
-                                          checkpoint_dir=checkpoint_dirs.get(seed))
+                                          checkpoint_dir=checkpoint_dirs.get(seed), **credit_options)
             runner.run(episodes,interval)
             runners.append(runner)
         evaluations=[] if args.skip_final_evaluation else [row for runner in runners for row in runner.final_evaluation()]

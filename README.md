@@ -389,6 +389,96 @@ at reset. The centralized critic receives storage, current external inflows,
 previous releases, three time features and all five reservoirs' four limit
 features. The actor observation layout is `local_neighbors_next_day_limits_v2`.
 
+## Optional counterfactual action credit for HAPPO
+
+The default `--happo-credit-assignment team_gae` retains the shared team-GAE
+actor update described above. The opt-in `counterfactual` mode tests whether
+action-specific feedback improves guaranteed-output decisions while keeping
+the same shared `system_reward`, reservoir dynamics, and scalar centralized
+value function. This is an experimental, model-assisted HAPPO variant; it is
+not a claim of improved reliability or an unchanged standard HAPPO estimator.
+
+For every collected state, reservoir, and categorical command, the variant
+keeps the other four originally sampled commands fixed and computes
+
+```text
+Q_i(k) = system_reward(s, k, a_other) + gamma * V_frozen(s_next(k))
+baseline_i = sum_k pi_old_i(k | local_observation_i) * Q_i(k)
+credit_i = Q_i(actual_sampled_command_i) - baseline_i
+```
+
+The current-day reward and entire downstream cascade transition are evaluated
+with the physical model. The next-state value uses the collection critic and
+its original ValueNorm moments; a terminal transition has zero continuation
+value. The candidate next state contains that command's resulting storages and
+releases, while retaining the actual next day's forcing, bounds and time
+features. All commands, including a command that fails a service requirement,
+remain available. There is no automatic command replacement or hard service
+mask.
+
+The complete old categorical distribution, original sampled commands and
+physical starting state are frozen during collection. Counterfactual credit
+is computed once after the complete rollout and before actor or critic
+optimization. Each actor receives its own credit array, divided by one common
+RMS scale over controllable rollout/agent rows. No mean is subtracted, so a
+below-baseline selected command retains negative credit. Forced choices have
+zero credit. The existing PPO clipping, entropy term, controllability masks and
+sequential HAPPO likelihood factors are retained. The critic still fits the
+existing team GAE or discounted-return targets, separately from the new
+one-step actor estimator.
+
+The frozen critic supplies an estimate of future water value, not a verified
+long-term optimum. Model error, limited actor observations and noisy value
+estimates can still lead to poor decisions. Counterfactual alternatives are
+used for credit estimation and do not alter collected physical trajectories.
+MAPPO retains its original estimator; a comparison request combining MAPPO and
+counterfactual HAPPO is rejected so that the experimental estimator is not
+silently attributed to MAPPO. Use separate run logs for controlled comparisons.
+
+For a short inspection run with the original 1,825-day horizon:
+
+```bash
+cd /Users/hujingxin/Documents/Code_python/HARL-main
+RUN_DIR="runs/counterfactual_credit_$(date +%Y%m%d_%H%M%S)_$$"
+mkdir "$RUN_DIR"
+set -o pipefail
+
+PYTHONDONTWRITEBYTECODE=1 /opt/anaconda3/envs/harl/bin/python -B examples/train_cascade.py \
+  --happo-credit-assignment counterfactual --counterfactual-batch-size 4096 \
+  --episodes 12 --episode-days 1825 --parallel-envs 6 --seeds 1 \
+  --gamma 0.995 --eval-interval 1 --log-interval 1 \
+  --trajectory-diagnostics --save-checkpoints --checkpoint-interval 1 \
+  --episode-log "$RUN_DIR/happo_counterfactual.jsonl" \
+  --plot-python /Library/Frameworks/Python.framework/Versions/3.9/bin/python3 \
+  2>&1 | tee "$RUN_DIR/console.log"
+```
+
+For the full matched budget, use `--episodes 300 --seeds 1 2 3`. Keep the
+baseline's other settings unchanged and launch the baseline separately with
+`--happo-credit-assignment team_gae` and a different output path. The option
+`--counterfactual-batch-size` limits candidate transitions per inference chunk;
+it does not reduce the number of categorical alternatives evaluated. Exact
+enumeration adds substantial computation, especially with 100 commands and
+five reservoirs. It does not add environment transitions to the training-step
+counter.
+
+With `--episode-log`, counterfactual mode automatically creates a compressed
+`<log_stem>_seedN_counterfactual_credit.csv.gz`. It records five rows per
+collected day, with the full old action probabilities and candidate Q values,
+selected-command Q, expected baseline, raw and RMS-scaled actor credit, best
+candidate, controllability, and separate team-GAE advantage. Rows are written
+and flushed before optimization. Per-update JSONL summaries report credit
+statistics, computation time and selected-command Q reconciliation with the
+actual rollout. Existing physical/learning traces label the actor estimator
+separately from the scalar critic's GAE target. Evaluation and held-out replay
+remain frozen-policy measurements and do not calculate actor training credit.
+
+Checkpoint settings preserve the chosen credit mode and estimator metadata;
+the critic continues to represent the shared team return. Evaluation replay
+does not resume optimization or reconstruct the original counterfactual actor
+advantages. A paused process retains the implementation it already loaded;
+new source changes apply to a newly launched experiment.
+
 ## Episode calendar and evaluation
 
 Training windows start on January 1 and contain exactly 1,825 consecutive

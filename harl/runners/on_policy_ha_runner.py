@@ -37,8 +37,15 @@ class OnPolicyHARunner(OnPolicyBaseRunner):
 
         # Every actor receives the same team advantage. Normalize once over
         # common rollout rows, before actor-specific masks or sequential F.
-        advantages = ((advantages - advantages.mean(axis=(0, 1), keepdims=True)) /
-                      (advantages.std(axis=(0, 1), keepdims=True) + 1e-5))
+        counterfactual = getattr(self, 'credit_assignment', 'team_gae') == 'counterfactual'
+        if counterfactual:
+            credits = getattr(self, 'counterfactual_advantages', None)
+            expected = advantages.shape[:2]+(self.num_agents,)
+            if credits is None or credits.shape != expected or not np.isfinite(credits).all():
+                raise ValueError('Counterfactual HAPPO requires frozen finite credit for every actor and rollout row')
+        else:
+            advantages = ((advantages - advantages.mean(axis=(0, 1), keepdims=True)) /
+                          (advantages.std(axis=(0, 1), keepdims=True) + 1e-5))
 
         if self.fixed_order:
             agent_order = list(range(self.num_agents))
@@ -79,7 +86,8 @@ class OnPolicyHARunner(OnPolicyBaseRunner):
             # Only the sequential likelihood factor and each actor's control
             # mask differ; the frozen normalized team advantage stays shared.
             actor_train_info = self.actor[agent_id].train(
-                self.actor_buffer[agent_id], advantages.copy(), "EP",
+                self.actor_buffer[agent_id],
+                (credits[...,agent_id:agent_id+1] if counterfactual else advantages).copy(), "EP",
                 **train_options
             )
 

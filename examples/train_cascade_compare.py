@@ -16,7 +16,8 @@ if str(ROOT) not in sys.path:
 from examples.train_cascade import main as cascade_main
 from examples.train_cascade_parallel import (
     run_parallel_experiment, step_metrics_paths, plot_output_paths,
-    xld_dispatch_paths, trajectory_diagnostics_paths, checkpoint_directories)
+    xld_dispatch_paths, trajectory_diagnostics_paths, checkpoint_directories,
+    counterfactual_credit_paths)
 from examples.plot_cascade_compare import validate_comparison
 from harl.runners.cascade_reservoir_runner import CascadeReservoirRunner
 from harl.runners.cascade_mappo_runner import CascadeMAPPORunner
@@ -53,6 +54,9 @@ def validate_algorithms(algorithms):
 def comparison_preflight(args, config):
     """Check every requested output and unsupported setting before any training."""
     algorithms = validate_algorithms(args.algorithms)
+    counterfactual = config['algo'].get('happo_credit_assignment','team_gae') == 'counterfactual'
+    if counterfactual and 'mappo' in algorithms:
+        raise ValueError('Counterfactual credit is a HAPPO-only variant; select --algorithms happo')
     if 'happo' in algorithms and config['algo'].get('share_param', False):
         raise ValueError('HAPPO retains five independent actors; its share_param must be false')
     paths = [] if args.episode_log is None else [Path(args.episode_log)]
@@ -65,6 +69,7 @@ def comparison_preflight(args, config):
         paths.extend(xld_dispatch_paths(log, seeds, args.xld_diagnostics).values())
         paths.extend(trajectory_diagnostics_paths(log, seeds, args.trajectory_diagnostics).values())
         paths.extend(checkpoint_directories(log, seeds, args.save_checkpoints).values())
+        paths.extend(counterfactual_credit_paths(log, seeds, counterfactual).values())
     if not args.no_plot:
         paths.extend(plot_output_paths(args.episode_log).values())
     resolved = [path.resolve() for path in paths]

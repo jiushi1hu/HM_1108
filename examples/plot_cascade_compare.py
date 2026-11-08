@@ -133,14 +133,17 @@ def _validate_architecture(algorithm, run):
     if objective is not None:
         if not isinstance(objective, dict):
             raise ValueError('learning_objective must be a mapping')
-        team = algorithm == 'happo' and objective.get('advantage_source') == 'shared_team'
+        counterfactual = (algorithm == 'happo' and
+            settings.get('algo', {}).get('happo_credit_assignment','team_gae') == 'counterfactual')
+        team = algorithm == 'happo' and objective.get('advantage_source') in ('shared_team','counterfactual_shared_team')
         expected_objective = dict(
-            advantage_source='shared_team' if team else 'individual_mixed',
+            advantage_source='counterfactual_shared_team' if counterfactual else 'shared_team' if team else 'individual_mixed',
             reward_formula=('0.5 * sum(local rewards) + 0.5 * global generation reward'
                             if team else '0.5 * own local reward + 0.5 * global generation reward'),
             critic_reward_layout='shared_team' if team else 'mixed_by_reservoir_then_legacy_team',
             actor_value_channels=[0]*5 if team else list(range(5)),
-            normalization=('once_over_common_rollout_rows' if team
+            normalization=('common_controllable_rms_without_centering' if counterfactual else
+                           'once_over_common_rollout_rows' if team
                            else 'per_reservoir_over_common_rollout_rows'
                            if settings.get('algo', {}).get('normalize_shared_advantages', False)
                            else 'per_reservoir_over_controllable_rows'))
@@ -250,7 +253,10 @@ def load_comparison(happo_log=None, mappo_log=None):
 
 def _label(algorithm, count, run):
     total = len(run['comparison_context']['shared_settings']['seeds'])
-    return algorithm.upper()+(' mean' if count == total else
+    method = algorithm.upper()
+    if run['comparison_context']['shared_settings'].get('algo',{}).get('happo_credit_assignment') == 'counterfactual':
+        method += ' counterfactual'
+    return method+(' mean' if count == total else
                               ' available-seed mean (n={})'.format(count))
 
 

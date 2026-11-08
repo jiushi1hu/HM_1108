@@ -47,6 +47,12 @@ def validate_seed(value):
     return int(value)
 
 
+def validate_credit_assignment(value):
+    if value not in ('team_gae', 'counterfactual'):
+        raise ValueError('happo_credit_assignment must be team_gae or counterfactual')
+    return value
+
+
 def value_normalization_update_schedule(algorithm_name, use_valuenorm):
     """Describe the algorithm's actual ValueNorm clock without updating it."""
     if not isinstance(use_valuenorm, bool):
@@ -69,13 +75,23 @@ class CascadeReservoirRunner(OnPolicyHARunner):
 
     def __init__(self, data, physical_config, algo_args, seed, episode_log=None, step_log=None,
                  periodic_windows=None, training_sampler=None, xld_log=None,
-                 trajectory_log=None, checkpoint_dir=None):
+                 trajectory_log=None, checkpoint_dir=None, counterfactual_log=None):
         seed = validate_seed(seed)
         self.data, self.physical_config = data, physical_config
         self.requested_args = copy.deepcopy(algo_args)
         self.algo_args = args = copy.deepcopy(algo_args)
         args['algo']['gamma'] = validate_discount_factor(args['algo']['gamma'])
         args['algo']['gae_lambda'] = validate_gae_lambda(args['algo']['gae_lambda'])
+        self.credit_assignment = validate_credit_assignment(args['algo'].get('happo_credit_assignment', 'team_gae'))
+        self.counterfactual_batch_size = positive_integer(args['algo'].get('counterfactual_batch_size', 4096),
+                                                         'counterfactual_batch_size')
+        if self.credit_assignment == 'counterfactual' and self.algorithm_name != 'happo':
+            raise ValueError('Counterfactual credit is an opt-in HAPPO variant; MAPPO requires team_gae')
+        self.counterfactual_credit = self.counterfactual_advantages = None
+        self.counterfactual_context = self.counterfactual_probabilities = None
+        self.counterfactual_log = counterfactual_log
+        if counterfactual_log is not None and self.credit_assignment != 'counterfactual':
+            raise ValueError('Counterfactual traces require counterfactual credit assignment')
         validate_value_normalization(args['algo']['use_clipped_value_loss'], args['train']['use_valuenorm'])
         self.length = positive_integer(args['train']['episode_length'], 'episode_days')
         self.n_envs = positive_integer(args['train']['n_rollout_threads'], 'parallel_envs')
@@ -187,7 +203,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         """Describe the actual policy target alongside preserved accounting fields."""
         team = self.critic_reward_layout == 'shared_team'
         common_rows = self.algo_args['algo'].get('normalize_shared_advantages', False)
-        return dict(algorithm=self.algorithm_name,
+        metadata = dict(algorithm=self.algorithm_name,
             critic_reward_layout=self.critic_reward_layout,
             actor_value_channels=list(self.actor_value_channels),
             advantage_source='shared_team' if team else 'individual_mixed',
@@ -199,6 +215,16 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                 'per_reservoir_over_controllable_rows'),
             actor_reward_definition=SYSTEM_REWARD_DEFINITION if team else ACTOR_REWARD_DEFINITION,
             mixed_reward_definition=ACTOR_REWARD_DEFINITION)
+        if getattr(self, 'credit_assignment', 'team_gae') == 'counterfactual':
+            metadata.update(happo_credit_assignment='counterfactual',
+                advantage_source='counterfactual_shared_team',
+                advantage_estimator='one_step_counterfactual',
+                critic_target_estimator='gae' if self.algo_args['algo'].get('use_gae', True) else 'discounted_return',
+                advantage_normalization='common_controllable_rms_without_centering',
+                counterfactual_definition='Q(selected joint command) - sum(pi_old_i(k|obs_i) * Q(k, other original commands))',
+                counterfactual_q='exact current system reward + gamma * frozen denormalized team V(next state)',
+                counterfactual_limitation='model-assisted one-step estimate; continuation critic can misrank future water value')
+        return metadata
 
     def _annotate_learning_rewards(self, record):
         """Add provenance to one runtime record and its learning/window summaries."""
@@ -264,6 +290,16 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                 self.action_bins, self.length, self.n_envs, self.algo_args['algo']['gamma'],
                 self.algo_args['algo']['gae_lambda'], self.seed)
         ids = list(range(self.episode_attempts+1, self.episode_attempts+self.n_envs+1))
+        use_counterfactual = getattr(self, 'credit_assignment', 'team_gae') == 'counterfactual'
+        self.counterfactual_credit = self.counterfactual_advantages = None
+        if use_counterfactual:
+            shape = (self.length, self.n_envs, self.num_agents)
+            self.counterfactual_context = {name:np.empty(shape, dtype=np.float64) for name in
+                ('storage_start', 'external', 'storage_lower', 'storage_upper', 'controls')}
+            self.counterfactual_context['actions'] = np.empty(shape, dtype=np.int64)
+            self.counterfactual_context['dates'] = np.empty(shape[:2], dtype=object)
+            self.counterfactual_context['episode_ids'] = ids
+            self.counterfactual_probabilities = np.empty(shape+(self.action_bins,), dtype=np.float32)
         if self.trajectory_log is not None:
             self.trajectory_log.begin_batch(seed=self.seed, update=self.update_count+1,
                 episode_ids=ids, window_starts=years, source_years=self.batch_source_years)
@@ -286,10 +322,21 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                 for i, b in enumerate(self.actor_buffer):
                     action, log_prob = self.actor[i].get_actions(b.obs[t])
                     actions.append(_t2n(action)); log_probs.append(_t2n(log_prob))
+                    if use_counterfactual:
+                        _, _, distribution = self.actor[i].evaluate_actions(
+                            b.obs[t], action, return_entropy_per_sample=True)
+                        self.counterfactual_probabilities[t,:,i] = _t2n(distribution.probs)
                 values = self.critic.get_values(cb.share_obs[t])
                 results = self.parallel_envs.step(np.stack(actions, axis=1))
                 self._log_collected_steps(list(enumerate(results)), ids, t)
                 transitions = [r['transition'] for r in results]
+                if use_counterfactual:
+                    context = self.counterfactual_context
+                    for name, source in (('storage_start','storage_start'), ('external','external'),
+                        ('storage_lower','storage_lower_m3'), ('storage_upper','storage_upper_m3'),
+                        ('controls','controls'), ('actions','sampled_actions')):
+                        context[name][t] = np.stack([row[source] for row in transitions])
+                    context['dates'][t] = [row['date'] for row in transitions]
                 if self.trajectory_log is not None:
                     self.trajectory_log.capture(t, transitions)
                 done = np.array([r['done'] for r in results])
@@ -350,6 +397,8 @@ class CascadeReservoirRunner(OnPolicyHARunner):
             batch_total_days=self.length*self.n_envs, batch_unique_window_count=len(set(years)),
             forced_fraction=forced/(self.length*self.n_envs*5), max_balance_residual_m3=largest_residual)
         self.compute()
+        if use_counterfactual:
+            self._compute_counterfactual_credit()
         predictions = cb.value_preds[:-1]
         if self.value_normalizer is not None:
             predictions = self.value_normalizer.denormalize(predictions)
@@ -361,6 +410,37 @@ class CascadeReservoirRunner(OnPolicyHARunner):
             value_prediction_mean=float(predictions.mean()),
             gae_target_rmse=float(np.sqrt(np.mean((targets-predictions)**2))),
             gae_target_explained_variance=float(1.-np.var(targets-predictions)/max(float(np.var(targets)),1e-8)))
+
+
+    @torch.no_grad()
+    def _compute_counterfactual_credit(self):
+        """Freeze every actor credit before any policy or ValueNorm update."""
+        from harl.envs.cascade_reservoir.counterfactual_credit import compute_counterfactual_credit
+        started = time.monotonic()
+        env, cb = self.envs[0], self.critic_buffer
+        credit = compute_counterfactual_credit(env.physics, env.operation_reward,
+            self.critic.get_values, self.value_normalizer, self.counterfactual_context,
+            cb.share_obs[1:], self.counterfactual_probabilities, cb.masks[1:],
+            cb.gamma, batch_size=self.counterfactual_batch_size)
+        next_values = cb.value_preds[1:]
+        if self.value_normalizer is not None:
+            next_values = self.value_normalizer.denormalize(next_values)
+        actual_q = cb.rewards[...,0] + cb.gamma*cb.masks[1:,:,0]*next_values[...,0]
+        difference = np.abs(credit['q_actual']-actual_q[...,None])
+        if not np.allclose(credit['q_actual'], actual_q[...,None], rtol=1e-4, atol=2e-3):
+            raise AssertionError('Counterfactual selected-command Q disagrees with the actual rollout')
+        credit['summary'].update(actual_q_reconciliation_max_abs=float(difference.max()),
+                                 computation_seconds=time.monotonic()-started)
+        self.counterfactual_credit = credit
+        self.counterfactual_advantages = credit['normalized_advantages'].copy()
+        self.last_rollout.update(counterfactual_seconds=credit['summary']['computation_seconds'],
+            counterfactual_raw_advantage_mean=float(credit['raw_advantages'].mean()),
+            counterfactual_advantage_scale=float(credit['advantage_scale']))
+        log_episode(dict(record_type='counterfactual_credit', seed=self.seed,
+            update=self.update_count+1, training_steps=self.collected_training_steps,
+            **credit['summary']), self.episode_log)
+        if self.counterfactual_log is not None:
+            self.counterfactual_log.write_batch(self)
 
 
     def run(self, episodes, log_interval=1):

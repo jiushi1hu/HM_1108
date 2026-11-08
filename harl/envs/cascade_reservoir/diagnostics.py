@@ -91,11 +91,16 @@ def before_update(runner):
         prediction = runner.value_normalizer.denormalize(prediction)
         next_prediction = runner.value_normalizer.denormalize(next_prediction)
     mc = monte_carlo_returns(cb.rewards, cb.masks, cb.gamma)
-    return dict(mc=mc, prediction=prediction, next_prediction=next_prediction,
+    result = dict(mc=mc, prediction=prediction, next_prediction=next_prediction,
                 gae_targets=cb.returns[:-1].copy(),
                 actor_parameters=[parameter_snapshot(a.actor) for a in runner.actor],
                 critic_parameters=parameter_snapshot(runner.critic.critic),
                 distributions=[actor_distribution(a,b) for a,b in zip(runner.actor, runner.actor_buffer)])
+    credit = getattr(runner, 'counterfactual_credit', None)
+    if credit is not None:
+        result['counterfactual_credit'] = {key:credit[key].copy() for key in
+            ('raw_advantages','normalized_advantages','q_actual','baseline')}
+    return result
 
 
 @torch.no_grad()

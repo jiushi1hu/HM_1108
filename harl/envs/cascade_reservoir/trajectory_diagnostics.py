@@ -51,10 +51,11 @@ TRAJECTORY_DIAGNOSTIC_FIELDS = (
     'own_value_frozen', 'own_next_value_frozen', 'next_state_mask', 'td_residual',
     'gae_target', 'raw_advantage', 'normalized_advantage', 'realized_reward_to_go',
     'episode_time_weight', 'policy_objective_weight', 'happo_factor',
+    'actor_advantage_estimator', 'counterfactual_q_selected', 'counterfactual_baseline',
 )
-_OPTIONAL_COLUMNS = set(_SERVICE_COLUMNS)
+_OPTIONAL_COLUMNS = set(_SERVICE_COLUMNS) | {'counterfactual_q_selected', 'counterfactual_baseline'}
 _TEXT_COLUMNS = {'date', 'reservoir_id', 'source_years',
-                 'learning_reward_source', 'value_basis', 'critic_reward_layout'}
+                 'learning_reward_source', 'value_basis', 'critic_reward_layout', 'actor_advantage_estimator'}
 _SUMMARY_FIELDS = ('local_reward', 'mixed_reward', 'learning_reward', 'own_value_frozen', 'td_residual',
                    'raw_advantage', 'normalized_advantage', 'realized_reward_to_go')
 
@@ -259,7 +260,13 @@ class TrajectoryDiagnosticsWriter:
                 raise ValueError('Actor masks must match complete rollout boundaries')
             channel = spec['actor_channels'][i]
             advantage = raw[..., channel:channel+1]
-            if shared:
+            credit = before.get('counterfactual_credit')
+            if credit is not None:
+                for name in ('raw_advantages','normalized_advantages','q_actual','baseline'):
+                    _array(credit[name], (days,lanes,len(IDS)), 'counterfactual '+name)
+                advantage = credit['raw_advantages'][...,i:i+1]
+                normalized = credit['normalized_advantages'][...,i:i+1]
+            elif shared:
                 normalized = common[..., channel:channel+1]
             elif active.any():
                 # Mirror HAPPO.train's float32 masked reductions exactly.
@@ -287,6 +294,9 @@ class TrajectoryDiagnosticsWriter:
             _array(logits, probabilities.shape, 'frozen action logs')
             _array(entropy, (days, lanes), 'frozen action entropy')
             actors.append(dict(channel=channel, raw=advantage, normalized=normalized,
+                counterfactual=credit,
+                advantage_estimator='one_step_counterfactual' if credit is not None else
+                                    'gae' if getattr(cb,'use_gae',True) else 'discounted_return',
                 learning_reward_source=spec['actor_reward_sources'][i],
                 value_basis=spec['actor_value_bases'][i],
                 critic_reward_layout=spec['layout'],
@@ -353,6 +363,11 @@ class TrajectoryDiagnosticsWriter:
                         gae_target=float(frozen['gae_targets'][t,lane,channel]),
                         raw_advantage=float(actor['raw'][t,lane,0]),
                         normalized_advantage=float(actor['normalized'][t,lane,0]),
+                        actor_advantage_estimator=actor['advantage_estimator'],
+                        counterfactual_q_selected=(float(actor['counterfactual']['q_actual'][t,lane,i])
+                                                  if actor['counterfactual'] is not None else None),
+                        counterfactual_baseline=(float(actor['counterfactual']['baseline'][t,lane,i])
+                                                 if actor['counterfactual'] is not None else None),
                         realized_reward_to_go=float(frozen['mc'][t,lane,channel]),
                         episode_time_weight=float(actor['time'][t,lane,0]),
                         policy_objective_weight=float(actor['weights'][t,lane,0]),
@@ -378,6 +393,8 @@ class TrajectoryDiagnosticsWriter:
             total_rows_written=self.rows_written, episode_horizon_days=len(self._transitions),
             parallel_environments=len(batch['episode_ids']), gamma=gamma,
             critic_reward_layout=spec['layout'], critic_fitted_reward_basis=spec['fitted_reward_basis'],
+            actor_advantage_estimator='one_step_counterfactual' if before.get('counterfactual_credit') is not None else
+                                      'gae' if getattr(runner.critic_buffer,'use_gae',True) else 'discounted_return',
             actor_value_channels=list(spec['actor_channels']),
             legacy_team_value_available=spec['legacy_value_available'],
             actor_temporal_weighting='uniform_rollout_rows',

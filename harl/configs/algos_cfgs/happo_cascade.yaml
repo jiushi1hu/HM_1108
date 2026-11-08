@@ -24,6 +24,9 @@ model:
   action_distribution: categorical
   action_bins: 100
 algo:
+  # Opt-in model-assisted actor estimator; the scalar critic keeps its GAE targets.
+  happo_credit_assignment: team_gae  # counterfactual compares all discrete commands
+  counterfactual_batch_size: 4096  # Maximum physics/critic candidate batch
   gamma: 0.995  # Discount for GAE, critic returns and return accounting; actor rows have no extra time weight.
   gae_lambda: 0.95
   share_param: false

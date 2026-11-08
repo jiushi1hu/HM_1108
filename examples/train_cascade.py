@@ -14,10 +14,11 @@ from harl.envs.cascade_reservoir.data_loader import (
 from harl.envs.cascade_reservoir.episodes import positive_integer
 from harl.envs.cascade_reservoir.reward import reward_settings, validate_discount_factor
 from harl.envs.cascade_reservoir.training_sampler import SAMPLING_MODES, validate_sampling_mode
-from harl.runners.cascade_reservoir_runner import validate_gae_lambda, validate_seed
+from harl.runners.cascade_reservoir_runner import (
+    validate_gae_lambda, validate_seed, validate_credit_assignment)
 from examples.train_cascade_parallel import (
     run_parallel_experiment, step_metrics_paths, plot_output_paths, xld_dispatch_paths,
-    trajectory_diagnostics_paths, checkpoint_directories)
+    trajectory_diagnostics_paths, checkpoint_directories, counterfactual_credit_paths)
 
 
 def load_configuration():
@@ -45,6 +46,10 @@ def main(argv=None, *, experiment_runner=run_parallel_experiment,
     parser.add_argument('--action-bins',type=int,help='Discrete actions per reservoir (default: 100)')
     parser.add_argument('--gamma',type=float,help='Discount factor in [0,1]; 1 gives undiscounted episode return')
     parser.add_argument('--gae-lambda',type=float,help='GAE trace parameter in [0,1]')
+    parser.add_argument('--happo-credit-assignment',choices=('team_gae','counterfactual'),
+                        help='Actor credit: baseline shared team GAE or model-assisted one-step counterfactual Q differences')
+    parser.add_argument('--counterfactual-batch-size',type=int,
+                        help='Maximum candidate rows per batched physics/critic call (default: 4096)')
     parser.add_argument('--guaranteed-output-violation-weight',type=float,
                         help='Soft local reward cost per guaranteed-output violation; 0 restores relative-deficit-only costs')
     parser.add_argument('--ppo-epochs',type=int,help='Actor optimization epochs per collection round')
@@ -107,6 +112,10 @@ def main(argv=None, *, experiment_runner=run_parallel_experiment,
         model['action_bins'] = args.action_bins
     if args.ppo_epochs is not None:
         algo['ppo_epoch'] = args.ppo_epochs
+    if args.happo_credit_assignment is not None:
+        algo['happo_credit_assignment'] = args.happo_credit_assignment
+    if args.counterfactual_batch_size is not None:
+        algo['counterfactual_batch_size'] = args.counterfactual_batch_size
     if args.head_model is not None:
         physical['head_model'] = args.head_model
     for name in ('guaranteed_output_scale','ecological_flow_scale'):
@@ -139,6 +148,9 @@ def main(argv=None, *, experiment_runner=run_parallel_experiment,
             raise ValueError('Categorical control requires at least two action bins')
         algo['gamma'] = validate_discount_factor(algo['gamma'] if args.gamma is None else args.gamma)
         algo['gae_lambda'] = validate_gae_lambda(algo['gae_lambda'] if args.gae_lambda is None else args.gae_lambda)
+        algo['happo_credit_assignment'] = validate_credit_assignment(algo.get('happo_credit_assignment','team_gae'))
+        algo['counterfactual_batch_size'] = positive_integer(algo.get('counterfactual_batch_size',4096),
+                                                           'counterfactual_batch_size')
         algo['ppo_epoch'] = validate_ppo_epochs(algo['ppo_epoch'])
         validate_value_normalization(algo['use_clipped_value_loss'],train['use_valuenorm'])
         for name in ('critic_epoch','actor_num_mini_batch','critic_num_mini_batch'):
@@ -173,6 +185,10 @@ def main(argv=None, *, experiment_runner=run_parallel_experiment,
         for path in checkpoint_directories(args.episode_log,exp['seeds'],args.save_checkpoints).values():
             if path.exists():
                 parser.error('Checkpoint directory already exists: '+str(path))
+        for path in counterfactual_credit_paths(args.episode_log,exp['seeds'],
+                algo['happo_credit_assignment']=='counterfactual').values():
+            if path.exists():
+                parser.error('Counterfactual trace already exists: '+str(path))
         if not args.no_plot:
             for path in plot_output_paths(args.episode_log).values():
                 if path.exists():

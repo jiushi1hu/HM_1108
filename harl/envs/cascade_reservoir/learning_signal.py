@@ -126,7 +126,13 @@ def learning_signal_report(runner, before, post_prediction):
         own = slice(channel, channel+1)
         actor_raw = raw_advantage[..., own]
         actor_mc_advantage = mc_advantage[..., own]
-        if shared:
+        gae_comparison = _advantage_comparison(actor_raw[objective], actor_mc_advantage[objective])
+        credit = before.get('counterfactual_credit')
+        if credit is not None:
+            actor_raw = credit['raw_advantages'][...,i:i+1]
+            actor_mc_advantage = mc[...,own]-credit['baseline'][...,i:i+1]
+            training_advantage = credit['normalized_advantages'][...,i:i+1]
+        elif shared:
             training_advantage = normalized_advantage[..., own]
         elif active.any():
             normalization_values = actor_raw.copy()
@@ -147,10 +153,14 @@ def learning_signal_report(runner, before, post_prediction):
             critic_mc_pre=_fit(mc[..., own], old_prediction[..., own]),
             critic_mc_post=_fit(mc[..., own], post_prediction[..., own]),
             controllable_rows=int(active.sum()), objective_rows=int(objective.sum()),
-            normalization_scope=('shared_team_common_rows' if spec['shared_team'] else
+            normalization_scope=('common_controllable_rms_without_centering' if credit is not None else
+                                 'shared_team_common_rows' if spec['shared_team'] else
                                  'own_channel_common_rows' if shared else 'actor_controllable_rows'),
+            actor_advantage_estimator='one_step_counterfactual' if credit is not None else
+                                      'gae' if getattr(cb,'use_gae',True) else 'discounted_return',
             raw_advantage=comparison['gae'], training_advantage=signal_statistics(training_advantage[objective]),
-            gae_mc_sign_disagreement_fraction=comparison['sign_disagreement_fraction'],
+            gae_mc_sign_disagreement_fraction=gae_comparison['sign_disagreement_fraction'],
+            counterfactual_mc_sign_disagreement_fraction=(comparison['sign_disagreement_fraction'] if credit is not None else None),
             nonzero_comparison_count=comparison['nonzero_comparison_count'], objective_weight_sum=weight_sum,
             weighted_training_advantage_mean=(float(np.sum(
                 weights[objective].astype(np.float64)*training_advantage[objective])/weight_sum)
