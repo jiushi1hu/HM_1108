@@ -168,9 +168,9 @@ class VCritic:
         Args:
             critic_buffer: (OnPolicyCriticBufferEP or OnPolicyCriticBufferFP) buffer containing training data related to critic.
             value_normalizer: (ValueNorm) normalize the rewards, denormalize critic outputs.
-            update_normalizer_once: HAPPO updates from the complete rollout once
-                before all critic epochs. The default preserves MAPPO's existing
-                per-minibatch statistics updates.
+            update_normalizer_once: the HAPPO and MAPPO runners update from the
+                complete rollout once before all critic epochs. The default
+                retains the per-minibatch mode for direct low-level callers.
         Returns:
             train_info: (dict) contains information regarding training update (e.g. loss, grad norms, etc).
         """

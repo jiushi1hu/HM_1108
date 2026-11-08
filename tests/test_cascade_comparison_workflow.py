@@ -306,8 +306,10 @@ class ShortComparisonIntegrationTest(unittest.TestCase):
         self.assertEqual(failed['partial_metrics']['evaluator_return'], 1.25)
 
     def test_shared_policy_preserves_raw_environment_and_buffer_layouts(self):
-        config_before = copy.deepcopy(self.config)
-        runner = CascadeMAPPORunner(self.data, self.physical, self.config, 1,
+        config = copy.deepcopy(self.config)
+        config['algo'].update(critic_epoch=5, critic_num_mini_batch=2)
+        config_before = copy.deepcopy(config)
+        runner = CascadeMAPPORunner(self.data, self.physical, config, 1,
                                     periodic_windows=self.windows)
         self.addCleanup(runner.close)
         core = runner.actor[0].core
@@ -324,7 +326,53 @@ class ShortComparisonIntegrationTest(unittest.TestCase):
         self.assertEqual(runner.actor_value_channels, (0, 1, 2, 3, 4))
         self.assertTrue(runner.algo_args['algo']['share_param'])
         self.assertEqual(runner.requested_args, config_before)
-        self.assertEqual(self.config, config_before)
+        old_statistics = copy.deepcopy(runner.value_normalizer.state_dict())
+        normalization_states, actor_completed = [], []
+        train_actor = core.share_param_train
+        normalize = runner.value_normalizer.normalize
+        update = runner.value_normalizer.update
+
+        def actor_update(buffers, advantages, *args, **kwargs):
+            for name, value in old_statistics.items():
+                self.assertTrue(torch.equal(value, runner.value_normalizer.state_dict()[name]), name)
+            raw = runner.critic_buffer.returns[:-1]-runner.value_normalizer.denormalize(
+                runner.critic_buffer.value_preds[:-1])
+            expected = (raw-raw.mean(axis=(0, 1), keepdims=True))/(
+                raw.std(axis=(0, 1), keepdims=True)+1e-5)
+            for i, own in enumerate(advantages):
+                np.testing.assert_array_equal(own, expected[..., i:i+1])
+            result = train_actor(buffers, advantages, *args, **kwargs)
+            actor_completed.append(True)
+            return result
+
+        def update_statistics(values):
+            self.assertEqual(actor_completed, [True])
+            update(values)
+
+        def normalize_targets(values):
+            normalization_states.append(copy.deepcopy(runner.value_normalizer.state_dict()))
+            return normalize(values)
+
+        with mock.patch.object(core, 'share_param_train', side_effect=actor_update), \
+                mock.patch.object(runner.value_normalizer, 'update', side_effect=update_statistics) as update_norm, \
+                mock.patch.object(runner.value_normalizer, 'normalize', side_effect=normalize_targets), \
+                mock.patch.object(runner.critic, 'update', wraps=runner.critic.update) as optimize, \
+                mock.patch.object(runner.critic, 'train', wraps=runner.critic.train) as train_critic, \
+                redirect_stdout(io.StringIO()):
+            runner.run(2)
+        train_critic.assert_called_once_with(runner.critic_buffer, runner.value_normalizer,
+                                            update_normalizer_once=True)
+        update_norm.assert_called_once()
+        self.assertEqual(update_norm.call_args.args[0].shape, (8, 6))
+        np.testing.assert_array_equal(update_norm.call_args.args[0],
+                                      runner.critic_buffer.returns[:-1].reshape(8, 6))
+        self.assertEqual(optimize.call_count, 10)
+        self.assertTrue(all(call.kwargs['update_normalizer'] is False for call in optimize.call_args_list))
+        self.assertTrue(normalization_states)
+        for state in normalization_states:
+            for name, value in runner.value_normalizer.state_dict().items():
+                self.assertTrue(torch.equal(state[name], value), name)
+        self.assertEqual(config, config_before)
 
     def test_three_paired_seeds_return_complete_histories_without_run_files(self):
         config = copy.deepcopy(self.config)
@@ -622,7 +670,10 @@ class SharedMAPPOTrainingDispatchTest(unittest.TestCase):
         runner.diagnostics_enabled = True
         raw = np.arange(48, dtype=np.float32).reshape(4, 2, 6)
         runner.critic_buffer = SimpleNamespace(returns=raw**2, value_preds=raw/7.)
-        runner.value_normalizer = SimpleNamespace(denormalize=lambda values: 2.*values)
+        runner.value_normalizer = ValueNorm(6, beta=.5)
+        runner.value_normalizer.update(np.array([[-3.], [1.], [4.]], dtype=np.float32)*
+            np.arange(1, 7, dtype=np.float32)+np.array([0., 8., -4., 20., -12., 32.], dtype=np.float32))
+        old_statistics = copy.deepcopy(runner.value_normalizer.state_dict())
 
         class Buffer:
             def __init__(self):
@@ -633,16 +684,20 @@ class SharedMAPPOTrainingDispatchTest(unittest.TestCase):
                 self.factor = factor.copy()
 
         runner.actor_buffer = [Buffer() for _ in range(5)]
-        expected = raw[:-1]**2-2.*raw[:-1]/7.
+        expected = raw[:-1]**2-runner.value_normalizer.denormalize(raw[:-1]/7.)
         expected = (expected-expected.mean(axis=(0, 1), keepdims=True))/(
             expected.std(axis=(0, 1), keepdims=True)+1e-5)
+        calls = []
 
         def joint_train(buffers, advantages, num_agents, state_type, diagnostics=False):
+            calls.append('actor')
             self.assertIs(buffers, runner.actor_buffer)
             self.assertEqual(num_agents, 5)
             self.assertEqual(state_type, 'EP')
             self.assertTrue(diagnostics)
             self.assertEqual(len(advantages), 5)
+            for name, value in old_statistics.items():
+                self.assertTrue(torch.equal(value, runner.value_normalizer.state_dict()[name]), name)
             for agent_id, (buffer, own_advantage) in enumerate(zip(buffers, advantages)):
                 np.testing.assert_array_equal(buffer.factor, np.ones((3, 2, 1)))
                 np.testing.assert_array_equal(own_advantage, expected[..., agent_id:agent_id+1])
@@ -652,10 +707,19 @@ class SharedMAPPOTrainingDispatchTest(unittest.TestCase):
         runner.actor = [SimpleNamespace(core=core,
             train=mock.Mock(side_effect=AssertionError('Shared actor was updated per reservoir')))
             for _ in range(5)]
-        runner.critic = SimpleNamespace(train=mock.Mock(return_value={'value_loss': 0.}))
+        def critic_train(buffer, normalizer, *, update_normalizer_once=False):
+            self.assertTrue(update_normalizer_once)
+            self.assertEqual(calls, ['actor'])
+            calls.append('critic')
+            normalizer.update(buffer.returns[:-1].reshape(-1, 6))
+            return {'value_loss': 0.}
+
+        runner.critic = SimpleNamespace(train=mock.Mock(side_effect=critic_train))
         infos, critic_info = runner.train()
         core.share_param_train.assert_called_once()
-        runner.critic.train.assert_called_once_with(runner.critic_buffer, runner.value_normalizer)
+        runner.critic.train.assert_called_once_with(runner.critic_buffer, runner.value_normalizer,
+                                                  update_normalizer_once=True)
+        self.assertEqual(calls, ['actor', 'critic'])
         self.assertEqual(critic_info['value_loss'], 0.)
         self.assertEqual(len({id(info) for info in infos}), 5)
         for actor, info in zip(runner.actor, infos):

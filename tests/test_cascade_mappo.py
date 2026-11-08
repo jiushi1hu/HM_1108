@@ -326,7 +326,9 @@ class MAPPORunnerDispatchTest(unittest.TestCase):
                 raise AssertionError('MAPPO runner must not evaluate cross-agent likelihood factors')
 
         class Critic:
-            def train(self, buffer, normalizer):
+            def train(self, buffer, normalizer, *, update_normalizer_once=False):
+                if not update_normalizer_once or calls != [0, 1, 2, 3, 4]:
+                    raise AssertionError('MAPPO must update ValueNorm once after all actor updates')
                 calls.append('critic')
                 return dict(value_loss=0.)
 

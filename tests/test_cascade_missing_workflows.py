@@ -205,21 +205,24 @@ class CriticValueNormUpdateTest(unittest.TestCase):
         buffer = OnPolicyCriticBufferEP(dict(config['train'], **config['algo'],
             episode_length=4, n_rollout_threads=2, critic_output_dim=channels), space)
         scales = np.arange(1, channels+1, dtype=np.float32)
+        offsets = np.array([0., 8., -4., 20., -12., 32.], dtype=np.float32)[:channels]
         buffer.share_obs[:-1] = np.arange(24, dtype=np.float32).reshape(4, 2, 3)/10.
         buffer.value_preds[:-1] = np.arange(8*channels, dtype=np.float32).reshape(4, 2, channels)/50.
-        buffer.returns[:-1] = np.arange(1, 9, dtype=np.float32).reshape(4, 2, 1)*scales
+        buffer.returns[:-1] = np.arange(1, 9, dtype=np.float32).reshape(4, 2, 1)*scales+offsets
         buffer.returns[-1] = 1e6*scales  # A terminal slot must never enter the statistics.
         buffer.masks[-1] = 0.
         normalizer = ValueNorm(channels, beta=.5)
-        normalizer.update(np.array([[-4.], [0.]], dtype=np.float32)*scales)
-        normalizer.update(np.array([[2.], [6.]], dtype=np.float32)*scales)
+        normalizer.update(np.array([[-4.], [0.]], dtype=np.float32)*scales+offsets)
+        normalizer.update(np.array([[2.], [6.]], dtype=np.float32)*scales+offsets)
         return critic, buffer, normalizer
 
     def test_once_updates_full_rollout_and_freezes_scale_across_epochs_and_minibatches(self):
-        reference_state = None
-        for epochs, minibatches in ((1, 1), (5, 1), (1, 4), (5, 4)):
-            with self.subTest(epochs=epochs, minibatches=minibatches):
-                critic, buffer, normalizer = self.fixture(epochs, minibatches)
+        reference_states = {}
+        for channels, epochs, minibatches in (
+                (channels, epochs, minibatches) for channels in (1, 6)
+                for epochs, minibatches in ((1, 1), (5, 1), (1, 4), (5, 4))):
+            with self.subTest(channels=channels, epochs=epochs, minibatches=minibatches):
+                critic, buffer, normalizer = self.fixture(epochs, minibatches, channels)
                 initial_model = copy.deepcopy(critic.critic.state_dict())
                 initial_statistics = copy.deepcopy(normalizer.state_dict())
                 observed_statistics = []
@@ -234,32 +237,42 @@ class CriticValueNormUpdateTest(unittest.TestCase):
                         mock.patch.object(critic, 'update', wraps=critic.update) as optimize:
                     info = critic.train(buffer, normalizer, update_normalizer_once=True)
                 update.assert_called_once()
+                scales = np.arange(1, channels+1, dtype=np.float32)
+                offsets = np.array([0., 8., -4., 20., -12., 32.], dtype=np.float32)[:channels]
                 np.testing.assert_array_equal(update.call_args.args[0],
-                                              np.arange(1, 9, dtype=np.float32).reshape(8, 1))
+                    np.arange(1, 9, dtype=np.float32).reshape(8, 1)*scales+offsets)
+                self.assertEqual(update.call_args.args[0].shape, (8, channels))
                 self.assertEqual(optimize.call_count, epochs*minibatches)
                 self.assertTrue(all(call.kwargs['update_normalizer'] is False
                                     for call in optimize.call_args_list))
                 self.assertTrue(observed_statistics)
-                # The seeded history has raw moments (1.5, 12, .75).
-                # One new batch, with mean 4.5 and mean square 25.5, gives:
-                torch.testing.assert_close(normalizer.running_mean, torch.tensor([3.]), rtol=0., atol=0.)
-                torch.testing.assert_close(normalizer.running_mean_sq, torch.tensor([18.75]), rtol=0., atol=0.)
+                # Before channel scaling/translation the seeded raw moments
+                # (1.5, 12, .75) become (3, 18.75, .875) after one new batch.
+                expected_mean = 3.*scales+.875*offsets
+                expected_square = 18.75*scales**2+6.*scales*offsets+.875*offsets**2
+                torch.testing.assert_close(normalizer.running_mean, torch.from_numpy(expected_mean), rtol=0., atol=0.)
+                torch.testing.assert_close(normalizer.running_mean_sq, torch.from_numpy(expected_square), rtol=0., atol=0.)
                 torch.testing.assert_close(normalizer.debiasing_term, torch.tensor(.875), rtol=0., atol=0.)
+                mean, variance = normalizer.running_mean_var()
+                torch.testing.assert_close(mean, torch.from_numpy((24./7.)*scales+offsets), rtol=1e-6, atol=1e-6)
+                torch.testing.assert_close(variance, torch.from_numpy((474./49.)*scales**2), rtol=1e-5, atol=1e-5)
                 for state in observed_statistics:
                     for name, value in normalizer.state_dict().items():
                         self.assertTrue(torch.equal(state[name], value), name)
-                if reference_state is None:
-                    reference_state = copy.deepcopy(normalizer.state_dict())
+                if channels not in reference_states:
+                    reference_states[channels] = copy.deepcopy(normalizer.state_dict())
                 else:
                     for name, value in normalizer.state_dict().items():
-                        self.assertTrue(torch.equal(value, reference_state[name]), name)
+                        self.assertTrue(torch.equal(value, reference_states[channels][name]), name)
                 self.assertFalse(torch.equal(initial_statistics['debiasing_term'],
                                              normalizer.debiasing_term))
                 self.assertTrue(any(not torch.equal(value, critic.critic.state_dict()[name])
                                     for name, value in initial_model.items()))
                 self.assertTrue(all(np.isfinite(float(value)) for value in info.values()))
 
-    def test_default_six_channel_path_still_updates_each_minibatch(self):
+    def test_low_level_default_keeps_per_minibatch_compatibility(self):
+        # Both cascade runners opt into once-per-rollout updates. The low-level
+        # VCritic API keeps its explicit default for other existing callers.
         critic, buffer, normalizer = self.fixture(epochs=5, minibatches=2, channels=6)
         with mock.patch.object(normalizer, 'update', wraps=normalizer.update) as update:
             info = critic.train(buffer, normalizer)

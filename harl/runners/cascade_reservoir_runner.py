@@ -53,10 +53,8 @@ def value_normalization_update_schedule(algorithm_name, use_valuenorm):
         raise ValueError('use_valuenorm must be a boolean')
     if not use_valuenorm:
         return 'disabled'
-    if algorithm_name == 'happo':
+    if algorithm_name in ('happo', 'mappo'):
         return 'once_per_rollout_before_critic_epochs'
-    if algorithm_name == 'mappo':
-        return 'per_critic_minibatch'
     raise ValueError('Unknown algorithm for the ValueNorm update schedule')
 
 

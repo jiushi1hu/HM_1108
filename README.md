@@ -351,17 +351,19 @@ each output separately, and its existing normalization flag retains its prior
 per-reservoir behavior. The diagnostic team value and GAE fields identify
 their reward basis explicitly; HAPPO no longer trains a legacy value head.
 
-HAPPO updates ValueNorm once per completed rollout, using all critic targets
-in `returns[:-1]`, before the critic epochs. GAE, the common actor advantage
-and frozen diagnostics first use the old moments; all actor updates finish
-before this statistics update. The new moments then stay fixed across all
-five configured critic epochs and their minibatches. Previously the moments
-were updated once per critic minibatch, or `epochs * minibatches` times per
-rollout. MAPPO retains that per-minibatch schedule. The metadata field
+Both HAPPO and MAPPO update ValueNorm once per completed rollout batch, using
+all critic targets in `returns[:-1]`, before the critic epochs. GAE, actor
+advantages and frozen diagnostics first use the old moments; all actor updates
+finish before this statistics update. HAPPO retains one common team advantage;
+MAPPO retains five individual mixed-return advantages. MAPPO updates all six
+value channels together, with separate mean and variance statistics per channel.
+The new moments stay fixed across all five configured critic epochs and their
+minibatches. Previously the moments were updated once per critic minibatch, or
+`epochs * minibatches` times per rollout. The metadata field
 `value_normalization_update` records the schedule, or `disabled` without ValueNorm.
 
-The ValueNorm beta is retained; HAPPO's EMA clock now counts rollouts rather
-than reused optimization minibatches. This is not PopArt: critic output
+The ValueNorm beta is retained; both algorithms' EMA clocks now count rollout
+batches rather than reused optimization minibatches. This is not PopArt: critic output
 weights are not rescaled when the moments change. Post-update values use the
 new moments, while frozen pre-update values retain their original reward-unit
 interpretation. Clipped value loss combined with ValueNorm remains unsupported.

@@ -8,7 +8,7 @@ class OnPolicyMARunner(OnPolicyBaseRunner):
     """Update shared or independent policies without likelihood corrections."""
 
     def train(self):
-        """Use the same per-agent return channels and critic update as HAPPO."""
+        """Use own mixed-return advantages and a fixed-scale critic update."""
         if self.value_normalizer is not None:
             advantages = self.critic_buffer.returns[:-1] - self.value_normalizer.denormalize(
                 self.critic_buffer.value_preds[:-1])
@@ -57,5 +57,10 @@ class OnPolicyMARunner(OnPolicyBaseRunner):
             # certify that no sequential importance correction was applied.
             info['factor_min'] = info['factor_max'] = 1.
 
-        critic_train_info = self.critic.train(self.critic_buffer, self.value_normalizer)
+        # Own advantages and actor updates use the rollout's original moments.
+        # Update each value channel once from all rollout returns, then
+        # retain that scale for every critic epoch and minibatch.
+        critic_train_info = self.critic.train(
+            self.critic_buffer, self.value_normalizer, update_normalizer_once=True
+        )
         return actor_train_infos, critic_train_info
