@@ -75,7 +75,8 @@ class VCritic:
         validate_value_normalization(self.use_clipped_value_loss, value_normalizer is not None)
 
     def cal_value_loss(
-        self, values, value_preds_batch, return_batch, value_normalizer=None
+        self, values, value_preds_batch, return_batch, value_normalizer=None,
+        *, update_normalizer=True
     ):
         """Calculate value function loss.
         Args:
@@ -83,6 +84,8 @@ class VCritic:
             value_preds_batch: (torch.Tensor) "old" value  predictions from data batch (used for value clip loss)
             return_batch: (torch.Tensor) reward to go returns.
             value_normalizer: (ValueNorm) normalize the rewards, denormalize critic outputs.
+            update_normalizer: update running statistics from this minibatch;
+                false when train() has already updated once from the rollout.
         Returns:
             value_loss: (torch.Tensor) value function loss.
         """
@@ -91,7 +94,8 @@ class VCritic:
             -self.clip_param, self.clip_param
         )
         if value_normalizer is not None:
-            value_normalizer.update(return_batch)
+            if update_normalizer:
+                value_normalizer.update(return_batch)
             error_clipped = (
                 value_normalizer.normalize(return_batch) - value_pred_clipped
             )
@@ -116,11 +120,12 @@ class VCritic:
 
         return value_loss
 
-    def update(self, sample, value_normalizer=None):
+    def update(self, sample, value_normalizer=None, *, update_normalizer=True):
         """Update critic network.
         Args:
             sample: (Tuple) contains data batch with which to update networks.
             value_normalizer: (ValueNorm) normalize the rewards, denormalize critic outputs.
+            update_normalizer: whether this minibatch updates running statistics.
         Returns:
             value_loss: (torch.Tensor) value function loss.
             critic_grad_norm: (torch.Tensor) gradient norm from critic update.
@@ -139,7 +144,8 @@ class VCritic:
         values = self.get_values(share_obs_batch)
 
         value_loss = self.cal_value_loss(
-            values, value_preds_batch, return_batch, value_normalizer=value_normalizer
+            values, value_preds_batch, return_batch, value_normalizer=value_normalizer,
+            update_normalizer=update_normalizer
         )
 
         self.critic_optimizer.zero_grad()
@@ -157,15 +163,24 @@ class VCritic:
 
         return value_loss, critic_grad_norm
 
-    def train(self, critic_buffer, value_normalizer=None):
+    def train(self, critic_buffer, value_normalizer=None, *, update_normalizer_once=False):
         """Perform a training update using minibatch GD.
         Args:
             critic_buffer: (OnPolicyCriticBufferEP or OnPolicyCriticBufferFP) buffer containing training data related to critic.
             value_normalizer: (ValueNorm) normalize the rewards, denormalize critic outputs.
+            update_normalizer_once: HAPPO updates from the complete rollout once
+                before all critic epochs. The default preserves MAPPO's existing
+                per-minibatch statistics updates.
         Returns:
             train_info: (dict) contains information regarding training update (e.g. loss, grad norms, etc).
         """
         self._validate_value_normalizer(value_normalizer)
+        if update_normalizer_once and value_normalizer is not None:
+            # Returns are in reward units and GAE has already used the rollout's
+            # original statistics. Exclude the terminal/bootstrap slot; flatten
+            # time and environments, retaining the separate value channels.
+            returns = critic_buffer.returns[:-1]
+            value_normalizer.update(returns.reshape(-1, returns.shape[-1]))
         train_info = {}
 
         train_info["value_loss"] = 0
@@ -178,7 +193,8 @@ class VCritic:
 
             for sample in data_generator:
                 value_loss, critic_grad_norm = self.update(
-                    sample, value_normalizer=value_normalizer
+                    sample, value_normalizer=value_normalizer,
+                    update_normalizer=not update_normalizer_once
                 )
 
                 train_info["value_loss"] += value_loss.item()

@@ -14,7 +14,8 @@ from harl.envs.cascade_reservoir.xld_diagnostics import (
     XLDDispatchWriter, XLD_DIAGNOSTIC_FIELDS, aggregate_xld_summaries)
 from harl.envs.cascade_reservoir.trajectory_diagnostics import (
     TrajectoryDiagnosticsWriter, TRAJECTORY_DIAGNOSTIC_FIELDS)
-from harl.runners.cascade_reservoir_runner import CascadeReservoirRunner
+from harl.runners.cascade_reservoir_runner import (
+    CascadeReservoirRunner, value_normalization_update_schedule)
 from harl.envs.cascade_reservoir.cascade_reservoir_env import actor_observation_features
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -207,6 +208,9 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
         device=config['device'],train=config['train'],model=config['model'],algo=shared_algo),
         data_hashes=data.hashes),sort_keys=True,allow_nan=False))
     metadata=dict(record_type='run_configuration',collection_mode='five_year_parallel',
+        value_normalization_update=value_normalization_update_schedule(
+            getattr(runner_cls,'algorithm_name',algorithm_name or 'happo'),
+            config['train']['use_valuenorm']),
         learning_reward_architecture=dict(alpha=0.5,
             actor_reward='0.5 * own local reward + 0.5 * global generation reward',
             local_reward='own power / installed capacity - own weighted relative service deficits '

@@ -122,6 +122,11 @@ class OnPolicyHARunner(OnPolicyBaseRunner):
             actor_train_infos[agent_id] = actor_train_info
 
         # update critic
-        critic_train_info = self.critic.train(self.critic_buffer, self.value_normalizer)
+        # GAE and the shared actor advantage were computed with the rollout's
+        # original ValueNorm statistics. Update them once only after those
+        # signals have been consumed, then freeze the scale for all critic epochs.
+        critic_train_info = self.critic.train(
+            self.critic_buffer, self.value_normalizer, update_normalizer_once=True
+        )
 
         return actor_train_infos, critic_train_info

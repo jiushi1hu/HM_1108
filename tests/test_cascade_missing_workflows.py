@@ -15,6 +15,7 @@ from unittest import mock
 import numpy as np
 import torch
 import yaml
+from gym.spaces import Box
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -25,6 +26,9 @@ from harl.envs.cascade_reservoir.evaluation import evaluate_policy
 from harl.envs.cascade_reservoir.periodic_evaluation import select_periodic_windows
 from harl.envs.cascade_reservoir.reward import (
     EpisodeRewardMetrics, OperationReward, reward_metadata, reward_settings)
+from harl.algorithms.critics.v_critic import VCritic
+from harl.common.buffers.on_policy_critic_buffer_ep import OnPolicyCriticBufferEP
+from harl.common.valuenorm import ValueNorm
 from harl.runners.cascade_reservoir_runner import CascadeReservoirRunner
 from harl.runners.on_policy_ha_runner import OnPolicyHARunner
 
@@ -185,7 +189,101 @@ class SharedTeamAdvantageTest(unittest.TestCase):
                 self.assertEqual(len(captured), 5)
                 for advantages in captured:
                     np.testing.assert_allclose(advantages, expected, rtol=1e-7)
-                runner.critic.train.assert_called_once_with(runner.critic_buffer, None)
+                runner.critic.train.assert_called_once_with(runner.critic_buffer, None,
+                                                          update_normalizer_once=True)
+
+
+class CriticValueNormUpdateTest(unittest.TestCase):
+    def fixture(self, epochs, minibatches, channels=1):
+        config = yaml.safe_load((ROOT/'harl/configs/algos_cfgs/happo_cascade.yaml').read_text())
+        args = dict(config['model'], **config['algo'])
+        args.update(hidden_sizes=[8, 8], critic_output_dim=channels,
+                    critic_epoch=epochs, critic_num_mini_batch=minibatches)
+        space = Box(-np.inf, np.inf, (3,), dtype=np.float32)
+        torch.manual_seed(17)
+        critic = VCritic(args, space)
+        buffer = OnPolicyCriticBufferEP(dict(config['train'], **config['algo'],
+            episode_length=4, n_rollout_threads=2, critic_output_dim=channels), space)
+        scales = np.arange(1, channels+1, dtype=np.float32)
+        buffer.share_obs[:-1] = np.arange(24, dtype=np.float32).reshape(4, 2, 3)/10.
+        buffer.value_preds[:-1] = np.arange(8*channels, dtype=np.float32).reshape(4, 2, channels)/50.
+        buffer.returns[:-1] = np.arange(1, 9, dtype=np.float32).reshape(4, 2, 1)*scales
+        buffer.returns[-1] = 1e6*scales  # A terminal slot must never enter the statistics.
+        buffer.masks[-1] = 0.
+        normalizer = ValueNorm(channels, beta=.5)
+        normalizer.update(np.array([[-4.], [0.]], dtype=np.float32)*scales)
+        normalizer.update(np.array([[2.], [6.]], dtype=np.float32)*scales)
+        return critic, buffer, normalizer
+
+    def test_once_updates_full_rollout_and_freezes_scale_across_epochs_and_minibatches(self):
+        reference_state = None
+        for epochs, minibatches in ((1, 1), (5, 1), (1, 4), (5, 4)):
+            with self.subTest(epochs=epochs, minibatches=minibatches):
+                critic, buffer, normalizer = self.fixture(epochs, minibatches)
+                initial_model = copy.deepcopy(critic.critic.state_dict())
+                initial_statistics = copy.deepcopy(normalizer.state_dict())
+                observed_statistics = []
+                normalize = normalizer.normalize
+
+                def record_normalize(values):
+                    observed_statistics.append(copy.deepcopy(normalizer.state_dict()))
+                    return normalize(values)
+
+                with mock.patch.object(normalizer, 'update', wraps=normalizer.update) as update, \
+                        mock.patch.object(normalizer, 'normalize', side_effect=record_normalize), \
+                        mock.patch.object(critic, 'update', wraps=critic.update) as optimize:
+                    info = critic.train(buffer, normalizer, update_normalizer_once=True)
+                update.assert_called_once()
+                np.testing.assert_array_equal(update.call_args.args[0],
+                                              np.arange(1, 9, dtype=np.float32).reshape(8, 1))
+                self.assertEqual(optimize.call_count, epochs*minibatches)
+                self.assertTrue(all(call.kwargs['update_normalizer'] is False
+                                    for call in optimize.call_args_list))
+                self.assertTrue(observed_statistics)
+                # The seeded history has raw moments (1.5, 12, .75).
+                # One new batch, with mean 4.5 and mean square 25.5, gives:
+                torch.testing.assert_close(normalizer.running_mean, torch.tensor([3.]), rtol=0., atol=0.)
+                torch.testing.assert_close(normalizer.running_mean_sq, torch.tensor([18.75]), rtol=0., atol=0.)
+                torch.testing.assert_close(normalizer.debiasing_term, torch.tensor(.875), rtol=0., atol=0.)
+                for state in observed_statistics:
+                    for name, value in normalizer.state_dict().items():
+                        self.assertTrue(torch.equal(state[name], value), name)
+                if reference_state is None:
+                    reference_state = copy.deepcopy(normalizer.state_dict())
+                else:
+                    for name, value in normalizer.state_dict().items():
+                        self.assertTrue(torch.equal(value, reference_state[name]), name)
+                self.assertFalse(torch.equal(initial_statistics['debiasing_term'],
+                                             normalizer.debiasing_term))
+                self.assertTrue(any(not torch.equal(value, critic.critic.state_dict()[name])
+                                    for name, value in initial_model.items()))
+                self.assertTrue(all(np.isfinite(float(value)) for value in info.values()))
+
+    def test_default_six_channel_path_still_updates_each_minibatch(self):
+        critic, buffer, normalizer = self.fixture(epochs=5, minibatches=2, channels=6)
+        with mock.patch.object(normalizer, 'update', wraps=normalizer.update) as update:
+            info = critic.train(buffer, normalizer)
+        self.assertEqual(update.call_count, 10)
+        batches = [np.asarray(call.args[0]) for call in update.call_args_list]
+        self.assertTrue(all(batch.shape == (4, 6) for batch in batches))
+        np.testing.assert_array_equal(np.sort(np.concatenate(batches), axis=0),
+            np.sort(np.tile(buffer.returns[:-1].reshape(8, 6), (5, 1)), axis=0))
+        self.assertEqual(float(normalizer.debiasing_term), 1.-.25*.5**10)
+        self.assertTrue(all(np.isfinite(float(value)) for value in info.values()))
+
+    def test_once_flag_without_normalizer_preserves_updates_and_rng(self):
+        plain, buffer, _ = self.fixture(epochs=2, minibatches=2)
+        once = copy.deepcopy(plain)
+        torch.manual_seed(72)
+        plain_info = plain.train(buffer, None)
+        state = torch.get_rng_state().clone()
+        torch.manual_seed(72)
+        once_info = once.train(buffer, None, update_normalizer_once=True)
+        self.assertTrue(torch.equal(state, torch.get_rng_state()))
+        torch.testing.assert_close(plain.critic.state_dict(), once.critic.state_dict(), rtol=0., atol=0.)
+        torch.testing.assert_close(plain.critic_optimizer.state_dict(), once.critic_optimizer.state_dict(),
+                                   rtol=0., atol=0.)
+        torch.testing.assert_close(plain_info, once_info, rtol=0., atol=0.)
 
 
 class MissingWorkflowIntegrationTest(unittest.TestCase):
@@ -239,7 +337,15 @@ class MissingWorkflowIntegrationTest(unittest.TestCase):
                                                periodic_windows=self.windows)
             self.addCleanup(baseline.close)
             initial = self.training_state(baseline)
-            baseline.run(2)
+            with mock.patch.object(baseline.value_normalizer, 'update',
+                    wraps=baseline.value_normalizer.update) as update_normalizer, \
+                    mock.patch.object(baseline.critic, 'train', wraps=baseline.critic.train) as train_critic:
+                baseline.run(2)
+            train_critic.assert_called_once_with(baseline.critic_buffer, baseline.value_normalizer,
+                                                update_normalizer_once=True)
+            update_normalizer.assert_called_once()
+            np.testing.assert_array_equal(update_normalizer.call_args.args[0],
+                baseline.critic_buffer.returns[:-1].reshape(-1, 1))
             expected = self.training_state(baseline)
             self.assertEqual(baseline.critic_reward_layout, 'shared_team')
             self.assertEqual(baseline.critic_output_dim, 1)

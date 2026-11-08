@@ -24,6 +24,7 @@ from examples import train_cascade_compare as compare
 from examples import train_cascade_parallel as parallel
 from harl.algorithms.actors.happo import HAPPO
 from harl.common.buffers.on_policy_actor_buffer import OnPolicyActorBuffer
+from harl.common.valuenorm import ValueNorm
 from harl.envs.cascade_reservoir.data_loader import CascadeData
 from harl.envs.cascade_reservoir.periodic_evaluation import select_periodic_windows
 from harl.envs.cascade_reservoir.reservoir_physics import InfeasibleCascade
@@ -520,8 +521,10 @@ class HAPPOSharedTeamAdvantageTest(unittest.TestCase):
                 values = np.arange(10, dtype=np.float32).reshape(5, 2, 1)/7.
                 returns = np.square(np.arange(10, dtype=np.float32).reshape(5, 2, 1))
                 runner.critic_buffer = SimpleNamespace(returns=returns, value_preds=values)
-                runner.value_normalizer = SimpleNamespace(denormalize=lambda array: 2.*array)
-                raw = returns[:-1]-2.*values[:-1]
+                runner.value_normalizer = ValueNorm(1, beta=.5)
+                runner.value_normalizer.update(np.array([[-3.], [1.], [4.]], dtype=np.float32))
+                old_statistics = copy.deepcopy(runner.value_normalizer.state_dict())
+                raw = returns[:-1]-runner.value_normalizer.denormalize(values[:-1])
                 expected = (raw-raw.mean(axis=(0, 1), keepdims=True))/(
                     raw.std(axis=(0, 1), keepdims=True)+1e-5)
                 calls, captured, factors = [], [], []
@@ -547,6 +550,9 @@ class HAPPOSharedTeamAdvantageTest(unittest.TestCase):
                               advantages_normalized=False):
                         if state_type != 'EP' or not advantages_normalized:
                             raise AssertionError('Shared team advantage must bypass per-actor normalization')
+                        if any(not torch.equal(value, runner.value_normalizer.state_dict()[name])
+                               for name, value in old_statistics.items()):
+                            raise AssertionError('ValueNorm changed before all actor advantages were consumed')
                         calls.append(self.index)
                         captured.append(advantages.copy())
                         factors.append(buffer.factor.copy())
@@ -557,8 +563,15 @@ class HAPPOSharedTeamAdvantageTest(unittest.TestCase):
 
                 runner.actor_buffer = [Buffer(i) for i in range(5)]
                 runner.actor = [Actor(i) for i in range(5)]
-                runner.critic = SimpleNamespace(train=mock.Mock(
-                    side_effect=lambda *args: calls.append('critic') or dict(value_loss=0.)))
+
+                def critic_train(buffer, normalizer, *, update_normalizer_once=False):
+                    self.assertTrue(update_normalizer_once)
+                    self.assertEqual(calls, [0, 1, 2, 3, 4])
+                    calls.append('critic')
+                    normalizer.update(buffer.returns[:-1].reshape(-1, 1))
+                    return dict(value_loss=0.)
+
+                runner.critic = SimpleNamespace(train=mock.Mock(side_effect=critic_train))
                 infos, _ = runner.train()
                 self.assertEqual(calls, [0, 1, 2, 3, 4, 'critic'])
                 for advantage in captured:
@@ -569,7 +582,10 @@ class HAPPOSharedTeamAdvantageTest(unittest.TestCase):
                     ratio = float(torch.exp(torch.tensor(.05*(i+1), dtype=torch.float32)))
                     product *= np.where(buffer.active_masks[:-1] > 0., ratio, 1.).astype(np.float32)
                     self.assertAlmostEqual(infos[i]['factor_max'], float(product.max()))
-                runner.critic.train.assert_called_once_with(runner.critic_buffer, runner.value_normalizer)
+                runner.critic.train.assert_called_once_with(runner.critic_buffer, runner.value_normalizer,
+                                                          update_normalizer_once=True)
+                self.assertFalse(torch.equal(old_statistics['debiasing_term'],
+                                             runner.value_normalizer.debiasing_term))
 
     def test_actor_explicitly_bypasses_per_mask_normalization(self):
         from gym.spaces import Box, Discrete

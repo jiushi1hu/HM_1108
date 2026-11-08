@@ -47,6 +47,19 @@ def validate_seed(value):
     return int(value)
 
 
+def value_normalization_update_schedule(algorithm_name, use_valuenorm):
+    """Describe the algorithm's actual ValueNorm clock without updating it."""
+    if not isinstance(use_valuenorm, bool):
+        raise ValueError('use_valuenorm must be a boolean')
+    if not use_valuenorm:
+        return 'disabled'
+    if algorithm_name == 'happo':
+        return 'once_per_rollout_before_critic_epochs'
+    if algorithm_name == 'mappo':
+        return 'per_critic_minibatch'
+    raise ValueError('Unknown algorithm for the ValueNorm update schedule')
+
+
 class CascadeReservoirRunner(OnPolicyHARunner):
     """Independent reservoir actors, centralized critic, and uninterrupted episodes."""
 
@@ -193,6 +206,8 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         """Add provenance to one runtime record and its learning/window summaries."""
         metadata = self._learning_reward_metadata()
         record.update(metadata)
+        record['value_normalization_update'] = value_normalization_update_schedule(
+            self.algorithm_name, getattr(self, 'value_normalizer', None) is not None)
         if isinstance(record.get('learning_rewards'), dict):
             record['learning_rewards'].update(metadata)
         for window in record.get('windows', ()):
@@ -452,7 +467,9 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         if self.update_count < 1:
             raise RuntimeError('No trained final policy is available')
         return dict(policy_source='final_training_update', policy_episode=self.completed_episodes,
-                    policy_training_steps=self.training_steps, policy_update=self.update_count)
+                    policy_training_steps=self.training_steps, policy_update=self.update_count,
+                    value_normalization_update=value_normalization_update_schedule(
+                        self.algorithm_name, self.value_normalizer is not None))
 
     def final_evaluation(self):
         metadata = self.evaluation_policy_metadata()

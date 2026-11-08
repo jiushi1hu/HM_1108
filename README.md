@@ -350,6 +350,24 @@ returns and output 5 estimates the legacy team return. MAPPO ValueNorm tracks
 each output separately, and its existing normalization flag retains its prior
 per-reservoir behavior. The diagnostic team value and GAE fields identify
 their reward basis explicitly; HAPPO no longer trains a legacy value head.
+
+HAPPO updates ValueNorm once per completed rollout, using all critic targets
+in `returns[:-1]`, before the critic epochs. GAE, the common actor advantage
+and frozen diagnostics first use the old moments; all actor updates finish
+before this statistics update. The new moments then stay fixed across all
+five configured critic epochs and their minibatches. Previously the moments
+were updated once per critic minibatch, or `epochs * minibatches` times per
+rollout. MAPPO retains that per-minibatch schedule. The metadata field
+`value_normalization_update` records the schedule, or `disabled` without ValueNorm.
+
+The ValueNorm beta is retained; HAPPO's EMA clock now counts rollouts rather
+than reused optimization minibatches. This is not PopArt: critic output
+weights are not rescaled when the moments change. Post-update values use the
+new moments, while frozen pre-update values retain their original reward-unit
+interpretation. Clipped value loss combined with ValueNorm remains unsupported.
+This change defines the normalization schedule; improved performance has not
+been established.
+
 `--no-daily-level-limits` selects global operating bounds only, with input
 dimensions 11/18.
 
